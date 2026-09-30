@@ -12,6 +12,8 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+BLOCKADE_RE = re.compile(r"^/api/blockades/(\d+)$")
+BLOCKADE_TIMELINE_RE = re.compile(r"^/api/blockades/(\d+)/audit$")
 
 
 def make_handler(service: Any, static_dir: Path):
@@ -27,6 +29,10 @@ def make_handler(service: Any, static_dir: Path):
             if not user_id or not role:
                 raise PermissionDenied("缺少X-User-Id或X-Role")
             return Actor(user_id=user_id, role=role, organization=self.headers.get("X-Org", ""))
+
+        def _idempotency_key(self) -> str:
+            key = self.headers.get("Idempotency-Key", "").strip()
+            return key or None
 
         def _body(self) -> Dict[str, Any]:
             try:
@@ -76,6 +82,27 @@ def make_handler(service: Any, static_dir: Path):
                     records = service.list_records(self._actor(), state=query.get("state", [None])[0], limit=int(query.get("limit", ["100"])[0]))
                     self._send(200, {"items": records})
                     return
+                if parsed.path == "/api/blockades":
+                    query = parse_qs(parsed.query)
+                    items = service.list_blockades(
+                        self._actor(),
+                        status=query.get("status", [None])[0],
+                        kind=query.get("kind", [None])[0],
+                        limit=int(query.get("limit", ["100"])[0]),
+                    )
+                    self._send(200, {"items": items})
+                    return
+                if parsed.path == "/api/stats":
+                    self._send(200, service.stats(self._actor()))
+                    return
+                match = BLOCKADE_TIMELINE_RE.match(parsed.path)
+                if match:
+                    self._send(200, {"items": service.blockade_timeline(self._actor(), int(match.group(1)))})
+                    return
+                match = BLOCKADE_RE.match(parsed.path)
+                if match:
+                    self._send(200, service.get_blockade(self._actor(), int(match.group(1))))
+                    return
                 match = RECORD_RE.match(parsed.path)
                 if match:
                     self._send(200, service.get_record(self._actor(), int(match.group(1))))
@@ -83,9 +110,6 @@ def make_handler(service: Any, static_dir: Path):
                 match = AUDIT_RE.match(parsed.path)
                 if match:
                     self._send(200, {"items": service.timeline(self._actor(), int(match.group(1)))})
-                    return
-                if parsed.path == "/api/stats":
-                    self._send(200, service.stats(self._actor()))
                     return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:
@@ -99,12 +123,39 @@ def make_handler(service: Any, static_dir: Path):
                     record = service.create(self._actor(), body.get("reference", ""), body.get("data", {}))
                     self._send(201, record)
                     return
+                if parsed.path == "/api/blockades":
+                    result = service.register_blockade(self._actor(), body.get("data", body), self._idempotency_key())
+                    self._send(200, result)
+                    return
+                if re.match(r"^/api/blockades/(\d+)/revoke$", parsed.path):
+                    blockade_id = int(parsed.path.split("/")[3])
+                    result = service.revoke_blockade(self._actor(), blockade_id, self._idempotency_key())
+                    self._send(200, result)
+                    return
+                if re.match(r"^/api/blockades/(\d+)/window$", parsed.path):
+                    blockade_id = int(parsed.path.split("/")[3])
+                    result = service.change_blockade_window(
+                        self._actor(), blockade_id, body.get("data", body), self._idempotency_key()
+                    )
+                    self._send(200, result)
+                    return
                 match = ACTION_RE.match(parsed.path)
                 if match:
+                    record_id = int(match.group(1))
+                    action = match.group(2)
+                    if action == "reschedule":
+                        version = body.get("expected_version")
+                        if not isinstance(version, int):
+                            raise ValidationError("expected_version必须是整数")
+                        result = service.reschedule_manual(
+                            self._actor(), record_id, version, body.get("data", {}), self._idempotency_key()
+                        )
+                        self._send(200, result)
+                        return
                     version = body.get("expected_version")
                     if not isinstance(version, int):
                         raise ValidationError("expected_version必须是整数")
-                    record = service.act(self._actor(), int(match.group(1)), version, match.group(2), body.get("data", {}))
+                    record = service.act(self._actor(), record_id, version, action, body.get("data", {}))
                     self._send(200, record)
                     return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})

@@ -6,28 +6,85 @@
   <title>港口泊位与航道调度</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; }
-    main { max-width: 960px; margin: auto; }
-    button { padding: .55rem .9rem; cursor: pointer; }
+    main { max-width: 1080px; margin: auto; }
+    button { padding: .5rem .9rem; cursor: pointer; }
     pre { background: #f4f6f8; padding: 1rem; overflow: auto; border-radius: 8px; }
-    .row { display: flex; gap: 1rem; align-items: center; }
+    .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin-bottom: .6rem; }
+    fieldset { border: 1px solid #d4dbe3; border-radius: 8px; margin-bottom: 1rem; }
+    input, select { padding: .4rem .5rem; }
+    table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+    th, td { border: 1px solid #dde3ea; padding: .35rem .5rem; text-align: left; }
+    .badge { display: inline-block; padding: .1rem .45rem; border-radius: 10px; font-size: .78rem; }
+    .s-draft, .s-confirmed { background: #e7f1ff; color: #1456c4; }
+    .s-auto_rescheduled { background: #fff4e0; color: #9a6200; }
+    .s-manual_rescheduled { background: #e9f8ec; color: #1f7a33; }
+    .s-reschedule_pending { background: #fdeaea; color: #b42318; }
+    .s-berthed, .s-departed { background: #eceff3; color: #475467; }
   </style>
 </head>
 <body>
 <main>
   <h1>港口泊位与航道调度</h1>
-  <p>最小演示页。完整业务流程通过README中的JSON接口调用。</p>
-  <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button></div>
+
+  <fieldset>
+    <legend>登记封锁（泊位停用 / 航道封控）</legend>
+    <div class="row">
+      <label>类型
+        <select id="b-kind">
+          <option value="berth_outage">泊位停用</option>
+          <option value="channel_closure">航道封控</option>
+        </select>
+      </label>
+      <label>对象 <input id="b-target" value="B12" size="8"></label>
+      <label>起(小时) <input id="b-start" type="number" value="8" style="width:5rem"></label>
+      <label>止(小时) <input id="b-end" type="number" value="20" style="width:5rem"></label>
+      <label>原因 <input id="b-reason" value="检修" size="12"></label>
+      <button id="b-register">登记并联动改期</button>
+    </div>
+  </fieldset>
+
+  <div class="row">
+    <button id="load">加载计划</button>
+    <button id="load-blockades">加载封锁</button>
+    <button id="stats">查看统计</button>
+  </div>
+  <div id="table-wrap"></div>
   <pre id="output">点击上方按钮读取服务状态。</pre>
 </main>
 <script>
-const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo"};
-async function show(path) {
-  const response = await fetch(path, {headers});
+const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo", "Content-Type":"application/json"};
+async function show(path, options) {
+  const response = await fetch(path, options ? {...options, headers: {...headers, ...(options.headers||{})}} : {headers});
   const data = await response.json();
   document.getElementById("output").textContent = JSON.stringify(data, null, 2);
+  return data;
 }
-document.getElementById("load").onclick = () => show("/api/records?limit=20");
+document.getElementById("load").onclick = async () => {
+  const data = await show("/api/records?limit=50");
+  const rows = (data.items || []).map(i => {
+    const w = i.payload;
+    const info = i.schedule_info;
+    const reason = info ? info.reason : "";
+    const reschedulable = info && info.reschedulable ? "可自动恢复" : (info ? "人工/待改期" : "—");
+    return `<tr><td>${i.reference}</td><td>${w.berth}</td><td>${w.channel}</td>
+      <td><span class="badge s-${i.state}">${i.state}</span></td>
+      <td>${w.eta_hour}-${w.etd_hour}</td><td>${reason}</td><td>${reschedulable}</td></tr>`;
+  }).join("");
+  document.getElementById("table-wrap").innerHTML =
+    `<table><tr><th>航次</th><th>泊位</th><th>航道</th><th>状态</th><th>窗口(时)</th><th>改期原因</th><th>恢复</th></tr>${rows}</table>`;
+};
+document.getElementById("load-blockades").onclick = () => show("/api/blockades?limit=50");
 document.getElementById("stats").onclick = () => show("/api/stats");
+document.getElementById("b-register").onclick = () => {
+  const body = {data: {
+    kind: document.getElementById("b-kind").value,
+    target: document.getElementById("b-target").value,
+    start_hour: parseInt(document.getElementById("b-start").value, 10),
+    end_hour: parseInt(document.getElementById("b-end").value, 10),
+    reason: document.getElementById("b-reason").value,
+  }};
+  show("/api/blockades", {method: "POST", body: JSON.stringify(body)});
+};
 </script>
 </body>
 </html>
