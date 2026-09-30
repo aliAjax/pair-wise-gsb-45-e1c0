@@ -2,7 +2,7 @@
 import json
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .domain import Conflict, NotFound
 
@@ -47,8 +47,34 @@ class Repository:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS closures (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reference TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    start_hour INTEGER NOT NULL,
+                    end_hour INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    updated_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS closure_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    closure_id INTEGER NOT NULL REFERENCES closures(id) ON DELETE CASCADE,
+                    action TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    details TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state);
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
+                CREATE INDEX IF NOT EXISTS idx_closures_status ON closures(status);
+                CREATE INDEX IF NOT EXISTS idx_closure_events_closure ON closure_events(closure_id, id);
                 """
             )
 
@@ -115,6 +141,104 @@ class Repository:
             result = connection.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
             connection.commit()
         return self._row(result)
+
+    def _apply_plan_updates(self, connection: sqlite3.Connection, plan_updates: List[Dict[str, Any]], now: str) -> List[Dict[str, Any]]:
+        """在同一事务内批量更新计划并写入审计，任一失败由调用方整体回滚。"""
+        updated = []
+        for update in plan_updates:
+            row = connection.execute("SELECT version FROM records WHERE id=?", (update["record_id"],)).fetchone()
+            if row is None:
+                raise NotFound("记录不存在")
+            if int(row["version"]) != int(update["expected_version"]):
+                raise Conflict("版本冲突，请刷新后重试")
+            version = int(row["version"]) + 1
+            connection.execute(
+                "UPDATE records SET state=?,version=?,payload=?,updated_by=?,updated_at=? WHERE id=?",
+                (update["state"], version, json.dumps(update["payload"], ensure_ascii=False, sort_keys=True), update["actor_id"], now, update["record_id"]),
+            )
+            connection.execute(
+                "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (update["record_id"], update["action"], update["actor_id"], version, json.dumps(update["details"], ensure_ascii=False, sort_keys=True), now),
+            )
+            updated.append(self._row(connection.execute("SELECT * FROM records WHERE id=?", (update["record_id"],)).fetchone()))
+        return updated
+
+    def create_closure_with_effects(self, fields: Dict[str, Any], plan_updates: List[Dict[str, Any]], event_action: str, event_details: Dict[str, Any], actor_id: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """登记封锁并联动计划：封锁、计划、审计同一事务，失败整体回滚可重试。"""
+        now = _now()
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    "INSERT INTO closures(reference,kind,target,start_hour,end_hour,reason,status,version,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (fields["reference"], fields["kind"], fields["target"], int(fields["start_hour"]), int(fields["end_hour"]), fields["reason"], "active", 1, actor_id, actor_id, now, now),
+                )
+                closure_id = int(cursor.lastrowid)
+                connection.execute(
+                    "INSERT INTO closure_events(closure_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                    (closure_id, event_action, actor_id, 1, json.dumps(event_details, ensure_ascii=False, sort_keys=True), now),
+                )
+                updated = self._apply_plan_updates(connection, plan_updates, now)
+                row = connection.execute("SELECT * FROM closures WHERE id=?", (closure_id,)).fetchone()
+                connection.commit()
+            return dict(row), updated
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("reference已存在") from exc
+
+    def update_closure_with_effects(self, closure_id: int, expected_version: int, changes: Dict[str, Any], plan_updates: List[Dict[str, Any]], event_action: str, event_details: Dict[str, Any], actor_id: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """调整/撤销封锁并联动计划：封锁、计划、审计同一事务，失败整体回滚可重试。"""
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM closures WHERE id=?", (closure_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFound("封锁不存在")
+            if int(row["version"]) != int(expected_version):
+                connection.rollback()
+                raise Conflict("版本冲突，请刷新后重试")
+            version = int(row["version"]) + 1
+            merged = dict(row)
+            merged.update(changes)
+            connection.execute(
+                "UPDATE closures SET start_hour=?,end_hour=?,reason=?,status=?,version=?,updated_by=?,updated_at=? WHERE id=?",
+                (int(merged["start_hour"]), int(merged["end_hour"]), merged["reason"], merged["status"], version, actor_id, now, closure_id),
+            )
+            connection.execute(
+                "INSERT INTO closure_events(closure_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (closure_id, event_action, actor_id, version, json.dumps(event_details, ensure_ascii=False, sort_keys=True), now),
+            )
+            updated = self._apply_plan_updates(connection, plan_updates, now)
+            result = connection.execute("SELECT * FROM closures WHERE id=?", (closure_id,)).fetchone()
+            connection.commit()
+        return dict(result), updated
+
+    def get_closure(self, closure_id: int) -> Dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM closures WHERE id=?", (closure_id,)).fetchone()
+        if row is None:
+            raise NotFound("封锁不存在")
+        return dict(row)
+
+    def list_closures(self, status: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        with self._connect() as connection:
+            if status:
+                rows = connection.execute("SELECT * FROM closures WHERE status=? ORDER BY id DESC LIMIT ?", (status, limit)).fetchall()
+            else:
+                rows = connection.execute("SELECT * FROM closures ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def closure_timeline(self, closure_id: int) -> List[Dict[str, Any]]:
+        self.get_closure(closure_id)
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM closure_events WHERE closure_id=? ORDER BY id", (closure_id,)).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["details"] = json.loads(item["details"])
+            result.append(item)
+        return result
 
     def add_audit(self, record_id: int, actor_id: str, action: str, details: Dict[str, Any]) -> None:
         with self._connect() as connection:

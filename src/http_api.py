@@ -12,6 +12,9 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+CLOSURE_RE = re.compile(r"^/api/closures/(\d+)$")
+CLOSURE_ACTION_RE = re.compile(r"^/api/closures/(\d+)/actions/([a-z_]+)$")
+CLOSURE_AUDIT_RE = re.compile(r"^/api/closures/(\d+)/audit$")
 
 
 def make_handler(service: Any, static_dir: Path):
@@ -87,6 +90,19 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/api/stats":
                     self._send(200, service.stats(self._actor()))
                     return
+                if parsed.path == "/api/closures":
+                    query = parse_qs(parsed.query)
+                    closures = service.list_closures(self._actor(), status=query.get("status", [None])[0], limit=int(query.get("limit", ["100"])[0]))
+                    self._send(200, {"items": closures})
+                    return
+                match = CLOSURE_RE.match(parsed.path)
+                if match:
+                    self._send(200, service.get_closure(self._actor(), int(match.group(1))))
+                    return
+                match = CLOSURE_AUDIT_RE.match(parsed.path)
+                if match:
+                    self._send(200, {"items": service.closure_timeline(self._actor(), int(match.group(1)))})
+                    return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:
                 self._handle_error(exc)
@@ -98,6 +114,26 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/api/records":
                     record = service.create(self._actor(), body.get("reference", ""), body.get("data", {}))
                     self._send(201, record)
+                    return
+                if parsed.path == "/api/closures":
+                    result = service.register_closure(self._actor(), body.get("reference", ""), body.get("data", {}))
+                    self._send(201, result)
+                    return
+                match = CLOSURE_ACTION_RE.match(parsed.path)
+                if match:
+                    version = body.get("expected_version")
+                    if not isinstance(version, int):
+                        raise ValidationError("expected_version必须是整数")
+                    closure_id = int(match.group(1))
+                    action = match.group(2)
+                    if action == "adjust":
+                        result = service.adjust_closure(self._actor(), closure_id, version, body.get("data", {}))
+                    elif action == "revoke":
+                        result = service.revoke_closure(self._actor(), closure_id, version)
+                    else:
+                        self._send(404, {"error": "not_found", "message": "路径不存在"})
+                        return
+                    self._send(200, result)
                     return
                 match = ACTION_RE.match(parsed.path)
                 if match:

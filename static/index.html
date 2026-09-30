@@ -16,7 +16,7 @@
 <main>
   <h1>港口泊位与航道调度</h1>
   <p>最小演示页。完整业务流程通过README中的JSON接口调用。</p>
-  <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button></div>
+  <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button><button id="closures">封锁列表</button><button id="pending">待改期计划</button></div>
   <pre id="output">点击上方按钮读取服务状态。</pre>
 </main>
 <script>
@@ -28,6 +28,8 @@ async function show(path) {
 }
 document.getElementById("load").onclick = () => show("/api/records?limit=20");
 document.getElementById("stats").onclick = () => show("/api/stats");
+document.getElementById("closures").onclick = () => show("/api/closures?limit=20");
+document.getElementById("pending").onclick = () => show("/api/records?state=reschedule_pending&limit=20");
 </script>
 </body>
 </html>
